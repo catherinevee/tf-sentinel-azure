@@ -1,0 +1,196 @@
+// Policy: Azure Mandatory Tags Enforcement
+// Purpose: Enforce mandatory tagging standards on all Azure resources
+// Scope: All Azure managed resources
+// Enforcement: Hard Mandatory
+//
+// Validates:
+// - Presence of required tags on all resources
+// - Non-empty values for required tags
+// - Tag value format compliance
+// - Environment-specific tag requirements
+
+import "tfplan/v2" as tfplan
+import "tfstate/v2" as tfstate
+import "tfconfig/v2" as tfconfig
+import "tfrun" as tfrun
+import "strings"
+
+# Parameters with secure defaults
+param environment default "dev"
+param mandatory_tags default ["Environment", "Owner", "Project", "CostCenter", "Application"]
+param environment_specific_tags default {
+    "prod": ["BackupPolicy", "ComplianceLevel", "DataClassification"],
+    "staging": ["BackupPolicy", "ComplianceLevel"],
+    "dev": []
+}
+param tag_value_min_length default 2
+param tag_value_max_length default 100
+
+# Helper function to determine environment from workspace or tags
+determine_environment = func() {
+    workspace_name = strings.to_lower(tfrun.workspace.name)
+    
+    # Try to determine environment from workspace name
+    if strings.contains(workspace_name, "prod") {
+        return "prod"
+    } else if strings.contains(workspace_name, "staging") or strings.contains(workspace_name, "stage") {
+        return "staging"
+    } else if strings.contains(workspace_name, "dev") or strings.contains(workspace_name, "development") {
+        return "dev"
+    }
+    
+    # Default to provided parameter
+    return environment
+}
+
+# Helper function to validate tag values
+validate_tag_value = func(tag_key, tag_value, resource_address) {
+    # Input validation
+    if tag_value is null or tag_value is undefined {
+        print("Error: Tag '" + tag_key + "' has null/undefined value for resource:", resource_address)
+        return false
+    }
+    
+    # Convert to string for validation
+    value_str = string(tag_value)
+    value_length = length(value_str)
+    
+    # Check minimum length
+    if value_length < tag_value_min_length {
+        print("Error: Tag '" + tag_key + "' value too short (min " + string(tag_value_min_length) + " chars) for resource:", resource_address)
+        return false
+    }
+    
+    # Check maximum length
+    if value_length > tag_value_max_length {
+        print("Error: Tag '" + tag_key + "' value too long (max " + string(tag_value_max_length) + " chars) for resource:", resource_address)
+        return false
+    }
+    
+    # Check for whitespace-only values
+    trimmed_value = strings.trim_space(value_str)
+    if length(trimmed_value) == 0 {
+        print("Error: Tag '" + tag_key + "' contains only whitespace for resource:", resource_address)
+        return false
+    }
+    
+    # Environment tag validation
+    if tag_key is "Environment" {
+        allowed_environments = ["dev", "staging", "prod", "test", "qa"]
+        if strings.to_lower(trimmed_value) not in allowed_environments {
+            print("Error: Environment tag must be one of", allowed_environments, "for resource:", resource_address)
+            return false
+        }
+    }
+    
+    return true
+}
+
+# Helper function to get all required tags for current environment
+get_required_tags = func(env) {
+    base_tags = mandatory_tags
+    env_specific = environment_specific_tags[env] else []
+    
+    # Combine base and environment-specific tags
+    all_required_tags = []
+    for base_tags as tag {
+        all_required_tags = append(all_required_tags, tag)
+    }
+    for env_specific as tag {
+        all_required_tags = append(all_required_tags, tag)
+    }
+    
+    return all_required_tags
+}
+
+# Main validation function for tags
+validate_resource_tags = func(resource, required_tags) {
+    # Input validation
+    if resource is null or resource is undefined {
+        print("Error: Resource is null or undefined")
+        return false
+    }
+    
+    resource_address = resource.address else "unknown"
+    resource_tags = resource.change.after.tags else {}
+    
+    # Handle computed tags gracefully
+    if resource_tags is computed {
+        print("Warning: Tags are computed for resource:", resource_address)
+        print("Manual verification required after apply")
+        return true  # Allow computed tags to pass
+    }
+    
+    violations = []
+    
+    # Check each required tag
+    for required_tags as tag {
+        if tag not in keys(resource_tags) {
+            append(violations, "Missing required tag: " + tag)
+        } else {
+            tag_value = resource_tags[tag]
+            if not validate_tag_value(tag, tag_value, resource_address) {
+                append(violations, "Invalid value for tag: " + tag)
+            }
+        }
+    }
+    
+    # Report all violations for this resource
+    if length(violations) > 0 {
+        print("Tag policy violations for resource:", resource_address)
+        for violations as violation {
+            print("  -", violation)
+        }
+        return false
+    }
+    
+    return true
+}
+
+# Efficient resource filtering - only target resources that support tags
+azure_resources_with_tags = filter tfplan.resource_changes as _, rc {
+    rc.mode is "managed" and
+    rc.change.actions is not ["delete"] and
+    rc.type in [
+        "azurerm_resource_group",
+        "azurerm_virtual_machine",
+        "azurerm_linux_virtual_machine", 
+        "azurerm_windows_virtual_machine",
+        "azurerm_virtual_machine_scale_set",
+        "azurerm_storage_account",
+        "azurerm_app_service",
+        "azurerm_app_service_plan",
+        "azurerm_function_app",
+        "azurerm_kubernetes_cluster",
+        "azurerm_container_instance",
+        "azurerm_sql_server",
+        "azurerm_sql_database",
+        "azurerm_cosmosdb_account",
+        "azurerm_key_vault",
+        "azurerm_application_gateway",
+        "azurerm_load_balancer",
+        "azurerm_public_ip",
+        "azurerm_network_security_group",
+        "azurerm_virtual_network",
+        "azurerm_subnet",
+        "azurerm_recovery_services_vault",
+        "azurerm_monitor_diagnostic_setting"
+    ]
+}
+
+# Determine current environment
+current_environment = determine_environment()
+required_tags_for_env = get_required_tags(current_environment)
+
+# Print policy information
+print("Azure Mandatory Tags Policy")
+print("Environment:", current_environment)
+print("Required tags:", required_tags_for_env)
+print("Evaluating", length(azure_resources_with_tags), "resources")
+
+# Main rule with comprehensive validation
+main = rule when length(azure_resources_with_tags) > 0 {
+    all azure_resources_with_tags as _, resource {
+        validate_resource_tags(resource, required_tags_for_env)
+    }
+}

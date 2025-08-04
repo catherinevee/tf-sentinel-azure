@@ -1,0 +1,253 @@
+name: Sentinel Policy CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+env:
+  SENTINEL_VERSION: "0.22.1"
+
+jobs:
+  validate:
+    name: Validate Policies
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      
+    - name: Setup Sentinel
+      run: |
+        wget -O sentinel.zip https://releases.hashicorp.com/sentinel/${SENTINEL_VERSION}/sentinel_${SENTINEL_VERSION}_linux_amd64.zip
+        unzip sentinel.zip
+        sudo mv sentinel /usr/local/bin/
+        sentinel version
+        
+    - name: Validate Sentinel Syntax
+      run: |
+        echo "Validating Sentinel policy syntax..."
+        for policy in policies/*.sentinel; do
+          echo "Validating $policy..."
+          sentinel fmt -check "$policy" || exit 1
+        done
+        echo "All policies validated successfully!"
+        
+    - name: Validate HCL Syntax
+      run: |
+        # Install Terraform for HCL validation
+        wget -O terraform.zip https://releases.hashicorp.com/terraform/1.6.0/terraform_1.6.0_linux_amd64.zip
+        unzip terraform.zip
+        sudo mv terraform /usr/local/bin/
+        
+        echo "Validating HCL syntax..."
+        terraform fmt -check -recursive .
+        
+  test:
+    name: Test Policies
+    runs-on: ubuntu-latest
+    needs: validate
+    
+    strategy:
+      matrix:
+        environment: [dev, staging, prod]
+        
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      
+    - name: Setup Sentinel
+      run: |
+        wget -O sentinel.zip https://releases.hashicorp.com/sentinel/${SENTINEL_VERSION}/sentinel_${SENTINEL_VERSION}_linux_amd64.zip
+        unzip sentinel.zip
+        sudo mv sentinel /usr/local/bin/
+        sentinel version
+        
+    - name: Run Tests for ${{ matrix.environment }}
+      run: |
+        echo "Running Sentinel tests for ${{ matrix.environment }} environment..."
+        sentinel test -global environment=${{ matrix.environment }} -verbose
+        
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: validate
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      
+    - name: Run Security Scan
+      run: |
+        echo "Scanning for security issues in policies..."
+        
+        # Check for hardcoded secrets or sensitive data
+        echo "Checking for hardcoded secrets..."
+        if grep -r -i "password\|secret\|key" policies/ --include="*.sentinel" | grep -v "# " | grep -v "//" ; then
+          echo "Warning: Potential hardcoded secrets found"
+          exit 1
+        fi
+        
+        # Check for overly permissive default values
+        echo "Checking for overly permissive defaults..."
+        if grep -r "0.0.0.0/0\|\*" policies/ --include="*.sentinel" | grep -v "# " | grep -v "//" ; then
+          echo "Info: Found wildcard values - ensure they are properly validated"
+        fi
+        
+        echo "Security scan completed successfully!"
+        
+  policy-analysis:
+    name: Policy Analysis
+    runs-on: ubuntu-latest
+    needs: test
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      
+    - name: Analyze Policy Coverage
+      run: |
+        echo "Analyzing policy coverage..."
+        
+        policy_count=$(find policies/ -name "*.sentinel" | wc -l)
+        test_count=$(find test/ -name "*.hcl" | wc -l)
+        
+        echo "Policies: $policy_count"
+        echo "Test cases: $test_count"
+        
+        # Check that each policy has at least 3 test cases
+        for policy in policies/*.sentinel; do
+          policy_name=$(basename "$policy" .sentinel)
+          test_dir="test/$policy_name"
+          
+          if [ -d "$test_dir" ]; then
+            test_case_count=$(find "$test_dir" -name "*.hcl" | wc -l)
+            echo "$policy_name: $test_case_count test cases"
+            
+            if [ "$test_case_count" -lt 3 ]; then
+              echo "Warning: $policy_name has fewer than 3 test cases"
+            fi
+          else
+            echo "Error: No test directory found for $policy_name"
+            exit 1
+          fi
+        done
+        
+        echo "Policy analysis completed!"
+        
+  documentation:
+    name: Generate Documentation
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        token: ${{ secrets.GITHUB_TOKEN }}
+        
+    - name: Generate Policy Documentation
+      run: |
+        echo "# Policy Documentation" > POLICIES.md
+        echo "" >> POLICIES.md
+        echo "Auto-generated documentation for Azure Sentinel policies." >> POLICIES.md
+        echo "" >> POLICIES.md
+        echo "Last updated: $(date)" >> POLICIES.md
+        echo "" >> POLICIES.md
+        
+        for policy in policies/*.sentinel; do
+          policy_name=$(basename "$policy" .sentinel)
+          echo "## $policy_name" >> POLICIES.md
+          echo "" >> POLICIES.md
+          
+          # Extract policy header comments
+          head -20 "$policy" | grep "^//" | sed 's|^// ||' | sed 's|^//||' >> POLICIES.md
+          echo "" >> POLICIES.md
+          
+          # Count test cases
+          test_dir="test/$policy_name"
+          if [ -d "$test_dir" ]; then
+            test_case_count=$(find "$test_dir" -name "*.hcl" | wc -l)
+            echo "**Test Cases:** $test_case_count" >> POLICIES.md
+          fi
+          
+          echo "" >> POLICIES.md
+          echo "---" >> POLICIES.md
+          echo "" >> POLICIES.md
+        done
+        
+    - name: Commit Documentation
+      run: |
+        git config --local user.email "action@github.com"
+        git config --local user.name "GitHub Action"
+        
+        if git diff --quiet POLICIES.md; then
+          echo "No documentation changes to commit"
+        else
+          git add POLICIES.md
+          git commit -m "Auto-update policy documentation [skip ci]"
+          git push
+        fi
+        
+  release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    needs: [test, security-scan, policy-analysis]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+        
+    - name: Generate Release Notes
+      id: release_notes
+      run: |
+        # Get the latest tag
+        latest_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+        
+        # Generate changelog
+        echo "## Changes since $latest_tag" > CHANGELOG.md
+        echo "" >> CHANGELOG.md
+        
+        # Get commits since last tag
+        git log --pretty=format:"- %s (%h)" $latest_tag..HEAD >> CHANGELOG.md
+        
+        # Set output for use in release
+        echo "changelog<<EOF" >> $GITHUB_OUTPUT
+        cat CHANGELOG.md >> $GITHUB_OUTPUT
+        echo "EOF" >> $GITHUB_OUTPUT
+        
+    - name: Create Release Tag
+      id: tag_version
+      run: |
+        # Generate new version tag
+        latest_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
+        
+        # Extract version numbers
+        version=${latest_tag#v}
+        IFS='.' read -ra ADDR <<< "$version"
+        major=${ADDR[0]:-0}
+        minor=${ADDR[1]:-0}
+        patch=${ADDR[2]:-0}
+        
+        # Increment patch version
+        new_patch=$((patch + 1))
+        new_version="v$major.$minor.$new_patch"
+        
+        echo "new_version=$new_version" >> $GITHUB_OUTPUT
+        
+    - name: Create GitHub Release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ steps.tag_version.outputs.new_version }}
+        release_name: Release ${{ steps.tag_version.outputs.new_version }}
+        body: ${{ steps.release_notes.outputs.changelog }}
+        draft: false
+        prerelease: false

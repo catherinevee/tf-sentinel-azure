@@ -1,0 +1,314 @@
+// Policy: Azure Resource Naming Convention
+// Purpose: Enforce consistent naming standards across all Azure resources
+// Scope: All Azure managed resources
+// Enforcement: Soft Mandatory
+//
+// Validates:
+// - Naming convention compliance
+// - Environment prefixes/suffixes
+// - Resource type abbreviations
+// - Character restrictions and length limits
+// - Prohibited naming patterns
+
+import "tfplan/v2" as tfplan
+import "tfstate/v2" as tfstate
+import "tfconfig/v2" as tfconfig
+import "tfrun" as tfrun
+import "strings"
+
+# Parameters with secure defaults
+param environment default "dev"
+param naming_convention default "prefix-resourcetype-purpose-environment-sequence"
+param environment_abbreviations default {
+    "dev": "dev",
+    "development": "dev", 
+    "staging": "stg",
+    "stage": "stg",
+    "prod": "prd",
+    "production": "prd",
+    "test": "tst",
+    "qa": "qa"
+}
+param resource_type_abbreviations default {
+    "azurerm_resource_group": "rg",
+    "azurerm_virtual_machine": "vm",
+    "azurerm_linux_virtual_machine": "lvm",
+    "azurerm_windows_virtual_machine": "wvm",
+    "azurerm_virtual_network": "vnet",
+    "azurerm_subnet": "snet",
+    "azurerm_network_security_group": "nsg",
+    "azurerm_storage_account": "st",
+    "azurerm_app_service": "app",
+    "azurerm_app_service_plan": "asp",
+    "azurerm_function_app": "func",
+    "azurerm_kubernetes_cluster": "aks",
+    "azurerm_sql_server": "sql",
+    "azurerm_sql_database": "sqldb",
+    "azurerm_key_vault": "kv",
+    "azurerm_application_gateway": "agw",
+    "azurerm_load_balancer": "lb",
+    "azurerm_public_ip": "pip",
+    "azurerm_recovery_services_vault": "rsv"
+}
+param organization_prefix default "contoso"
+param max_name_length default {
+    "azurerm_storage_account": 24,
+    "azurerm_key_vault": 24,
+    "default": 80
+}
+param min_name_length default 3
+param prohibited_words default ["test", "temp", "delete", "remove", "old"]
+param require_sequence_number default true
+
+# Helper function to determine environment
+determine_environment = func() {
+    workspace_name = strings.to_lower(tfrun.workspace.name)
+    
+    if strings.contains(workspace_name, "prod") {
+        return "prod"
+    } else if strings.contains(workspace_name, "staging") or strings.contains(workspace_name, "stage") {
+        return "staging"
+    } else if strings.contains(workspace_name, "dev") or strings.contains(workspace_name, "development") {
+        return "dev"
+    }
+    
+    return environment
+}
+
+# Helper function to get environment abbreviation
+get_environment_abbreviation = func(env) {
+    return environment_abbreviations[env] else env
+}
+
+# Helper function to get resource type abbreviation
+get_resource_type_abbreviation = func(resource_type) {
+    return resource_type_abbreviations[resource_type] else strings.replace(resource_type, "azurerm_", "")
+}
+
+# Helper function to validate character restrictions
+validate_characters = func(name, resource_type, resource_address) {
+    violations = []
+    
+    # Convert to lowercase for validation
+    name_lower = strings.to_lower(name)
+    
+    # Check for prohibited characters based on resource type
+    if resource_type is "azurerm_storage_account" {
+        # Storage accounts: only lowercase letters and numbers
+        for strings.split(name_lower, "") as char {
+            if char not in ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", 
+                          "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z",
+                          "0", "1", "2", "3", "4", "5", "6", "7", "8", "9"] {
+                append(violations, "Storage account names can only contain lowercase letters and numbers")
+                break
+            }
+        }
+    } else if resource_type is "azurerm_key_vault" {
+        # Key Vault: alphanumeric and hyphens, must start with letter
+        first_char = strings.substr(name_lower, 0, 1)
+        if first_char not in ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l", "m", 
+                            "n", "o", "p", "q", "r", "s", "t", "u", "v", "w", "x", "y", "z"] {
+            append(violations, "Key Vault names must start with a letter")
+        }
+        
+        # Check for invalid characters
+        if strings.contains(name_lower, "__") or strings.contains(name_lower, "--") {
+            append(violations, "Key Vault names cannot contain consecutive special characters")
+        }
+    }
+    
+    # Check for prohibited words
+    for prohibited_words as word {
+        if strings.contains(name_lower, word) {
+            append(violations, "Name contains prohibited word: " + word)
+        }
+    }
+    
+    if length(violations) > 0 {
+        print("Character validation violations for resource:", resource_address)
+        for violations as violation {
+            print("  -", violation)
+        }
+        return false
+    }
+    
+    return true
+}
+
+# Helper function to validate naming convention
+validate_naming_convention = func(name, resource_type, env, resource_address) {
+    violations = []
+    name_lower = strings.to_lower(name)
+    
+    # Get expected components
+    env_abbrev = get_environment_abbreviation(env)
+    type_abbrev = get_resource_type_abbreviation(resource_type)
+    
+    # Check if name contains environment abbreviation
+    if not strings.contains(name_lower, env_abbrev) {
+        append(violations, "Name should contain environment abbreviation '" + env_abbrev + "'")
+    }
+    
+    # Check if name contains resource type abbreviation (for certain resources)
+    if resource_type in keys(resource_type_abbreviations) {
+        if not strings.contains(name_lower, type_abbrev) {
+            append(violations, "Name should contain resource type abbreviation '" + type_abbrev + "'")
+        }
+    }
+    
+    # Check if name contains organization prefix
+    if length(organization_prefix) > 0 {
+        if not strings.contains(name_lower, organization_prefix) {
+            print("Warning: Name should contain organization prefix '" + organization_prefix + "':", resource_address)
+        }
+    }
+    
+    # Validate sequence number pattern if required
+    if require_sequence_number {
+        # Check for numeric suffix (01, 02, etc.)
+        has_sequence = false
+        if strings.contains(name_lower, "01") or strings.contains(name_lower, "02") or 
+           strings.contains(name_lower, "03") or strings.contains(name_lower, "1") or
+           strings.contains(name_lower, "2") or strings.contains(name_lower, "001") {
+            has_sequence = true
+        }
+        
+        if not has_sequence {
+            print("Warning: Consider adding sequence number for resource:", resource_address)
+        }
+    }
+    
+    if length(violations) > 0 {
+        print("Naming convention violations for resource:", resource_address)
+        for violations as violation {
+            print("  -", violation)
+        }
+        return false
+    }
+    
+    return true
+}
+
+# Helper function to validate name length
+validate_name_length = func(name, resource_type, resource_address) {
+    name_length = length(name)
+    max_length = max_name_length[resource_type] else max_name_length["default"]
+    
+    # Check minimum length
+    if name_length < min_name_length {
+        print("Error: Name too short (min " + string(min_name_length) + " chars) for resource:", resource_address)
+        return false
+    }
+    
+    # Check maximum length
+    if name_length > max_length {
+        print("Error: Name too long (max " + string(max_length) + " chars) for resource:", resource_address)
+        return false
+    }
+    
+    return true
+}
+
+# Main validation function for resource names
+validate_resource_name = func(resource, env) {
+    # Input validation
+    if resource is null or resource is undefined {
+        print("Error: Resource is null or undefined")
+        return false
+    }
+    
+    resource_address = resource.address else "unknown"
+    resource_type = resource.type
+    
+    # Get resource name from different possible attributes
+    resource_name = ""
+    resource_config = resource.change.after
+    
+    if resource_config is computed {
+        print("Warning: Resource configuration is computed for resource:", resource_address)
+        return true
+    }
+    
+    # Try different name attributes based on resource type
+    if "name" in keys(resource_config) {
+        resource_name = resource_config.name else ""
+    } else if "account_name" in keys(resource_config) {
+        resource_name = resource_config.account_name else ""
+    } else if "cluster_name" in keys(resource_config) {
+        resource_name = resource_config.cluster_name else ""
+    }
+    
+    # Handle computed names
+    if resource_name is computed {
+        print("Warning: Resource name is computed for resource:", resource_address)
+        return true
+    }
+    
+    # Skip validation if name is empty (might be auto-generated)
+    if length(resource_name) == 0 {
+        print("Warning: Resource name is empty or not found for resource:", resource_address)
+        return true
+    }
+    
+    # Validate name length
+    if not validate_name_length(resource_name, resource_type, resource_address) {
+        return false
+    }
+    
+    # Validate character restrictions
+    if not validate_characters(resource_name, resource_type, resource_address) {
+        return false
+    }
+    
+    # Validate naming convention
+    if not validate_naming_convention(resource_name, resource_type, env, resource_address) {
+        return false
+    }
+    
+    return true
+}
+
+# Efficient resource filtering - target all managed resources with names
+azure_named_resources = filter tfplan.resource_changes as _, rc {
+    rc.mode is "managed" and
+    rc.change.actions is not ["delete"] and
+    rc.type in [
+        "azurerm_resource_group",
+        "azurerm_virtual_machine",
+        "azurerm_linux_virtual_machine",
+        "azurerm_windows_virtual_machine",
+        "azurerm_virtual_network",
+        "azurerm_subnet",
+        "azurerm_network_security_group",
+        "azurerm_storage_account",
+        "azurerm_app_service",
+        "azurerm_app_service_plan",
+        "azurerm_function_app",
+        "azurerm_kubernetes_cluster",
+        "azurerm_sql_server",
+        "azurerm_sql_database",
+        "azurerm_key_vault",
+        "azurerm_application_gateway",
+        "azurerm_load_balancer",
+        "azurerm_public_ip",
+        "azurerm_recovery_services_vault"
+    ]
+}
+
+# Determine current environment
+current_environment = determine_environment()
+env_abbrev = get_environment_abbreviation(current_environment)
+
+# Print policy information
+print("Azure Resource Naming Policy")
+print("Environment:", current_environment, "(" + env_abbrev + ")")
+print("Organization prefix:", organization_prefix)
+print("Naming convention:", naming_convention)
+print("Evaluating", length(azure_named_resources), "named resources")
+
+# Main rule with comprehensive naming validation
+main = rule when length(azure_named_resources) > 0 {
+    all azure_named_resources as _, resource {
+        validate_resource_name(resource, current_environment)
+    }
+}

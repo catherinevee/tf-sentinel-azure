@@ -1,0 +1,33 @@
+import "tfplan/v2"
+
+computed = "computed"
+
+resource_changes = {
+  "azurerm_resource_group.computed_example": {
+    "address": "azurerm_resource_group.computed_example",
+    "mode": "managed",
+    "type": "azurerm_resource_group",
+    "name": "computed_example",
+    "provider_name": "registry.terraform.io/hashicorp/azurerm",
+    "change": {
+      "actions": ["create"],
+      "before": null,
+      "after": {
+        "location": "East US",
+        "name": "rg-computed-example-dev-001",
+        "tags": computed  // Tags are computed - should pass with warning
+      },
+      "after_unknown": {
+        "tags": true
+      },
+      "before_sensitive": false,
+      "after_sensitive": false
+    }
+  }
+}
+
+tfplan = {
+  "format_version": "1.1", 
+  "terraform_version": "1.5.0",
+  "resource_changes": resource_changes
+}

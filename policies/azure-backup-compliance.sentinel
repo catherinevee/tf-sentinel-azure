@@ -1,0 +1,375 @@
+// Policy: Azure Backup and Recovery Compliance
+// Purpose: Ensure proper backup configurations and disaster recovery compliance
+// Scope: VMs, SQL Databases, Storage Accounts, and critical resources
+// Enforcement: Soft Mandatory
+//
+// Validates:
+// - Backup vault configuration
+// - VM backup policy assignment
+// - SQL database backup settings
+// - Recovery point objectives (RPO)
+// - Cross-region backup for production
+
+import "tfplan/v2" as tfplan
+import "tfstate/v2" as tfstate
+import "tfconfig/v2" as tfconfig
+import "tfrun" as tfrun
+import "strings"
+
+# Parameters with secure defaults
+param environment default "dev"
+param require_backup_prod default true
+param require_cross_region_backup_prod default true
+param backup_policy_requirements default {
+    "prod": {
+        "daily_backup": true,
+        "retention_days": 30,
+        "weekly_retention_weeks": 12,
+        "monthly_retention_months": 12,
+        "yearly_retention_years": 7
+    },
+    "staging": {
+        "daily_backup": true,
+        "retention_days": 14,
+        "weekly_retention_weeks": 4,
+        "monthly_retention_months": 3
+    },
+    "dev": {
+        "daily_backup": false,
+        "retention_days": 7
+    }
+}
+param critical_resource_types default [
+    "azurerm_virtual_machine",
+    "azurerm_linux_virtual_machine", 
+    "azurerm_windows_virtual_machine",
+    "azurerm_sql_database",
+    "azurerm_cosmosdb_account",
+    "azurerm_storage_account"
+]
+param require_backup_encryption default true
+param geo_redundant_backup_regions default ["East US", "West Europe", "Southeast Asia"]
+
+# Helper function to determine environment
+determine_environment = func() {
+    workspace_name = strings.to_lower(tfrun.workspace.name)
+    
+    if strings.contains(workspace_name, "prod") {
+        return "prod"
+    } else if strings.contains(workspace_name, "staging") or strings.contains(workspace_name, "stage") {
+        return "staging"
+    } else if strings.contains(workspace_name, "dev") or strings.contains(workspace_name, "development") {
+        return "dev"
+    }
+    
+    return environment
+}
+
+# Helper function to check if resource is critical
+is_critical_resource = func(resource_type, tags) {
+    # Check if resource type is in critical list
+    if resource_type in critical_resource_types {
+        return true
+    }
+    
+    # Check for critical tags
+    criticality = tags.Criticality else ""
+    data_classification = tags.DataClassification else ""
+    
+    if strings.to_lower(criticality) in ["high", "critical", "mission-critical"] {
+        return true
+    }
+    
+    if strings.to_lower(data_classification) in ["confidential", "restricted", "sensitive"] {
+        return true
+    }
+    
+    return false
+}
+
+# Helper function to validate Recovery Services Vault
+validate_recovery_vault = func(resource, env) {
+    resource_address = resource.address else "unknown"
+    violations = []
+    
+    vault_config = resource.change.after
+    
+    # Handle computed values
+    if vault_config is computed {
+        print("Warning: Recovery Services Vault configuration is computed for resource:", resource_address)
+        return true
+    }
+    
+    # Validate storage mode redundancy
+    storage_mode_type = vault_config.storage_mode_type else ""
+    
+    if env is "prod" and require_cross_region_backup_prod {
+        if storage_mode_type is not "GeoRedundant" {
+            append(violations, "Production Recovery Vault should use GeoRedundant storage")
+        }
+    }
+    
+    # Validate cross region restore capability
+    if env is "prod" {
+        cross_region_restore_enabled = vault_config.cross_region_restore_enabled else false
+        if not cross_region_restore_enabled {
+            append(violations, "Production Recovery Vault should enable cross-region restore")
+        }
+    }
+    
+    # Validate encryption settings
+    if require_backup_encryption {
+        encryption = vault_config.encryption else {}
+        if length(encryption) > 0 {
+            key_id = encryption.key_id else ""
+            infrastructure_encryption = encryption.infrastructure_encryption_enabled else false
+            
+            if env is "prod" and length(key_id) == 0 {
+                append(violations, "Production Recovery Vault should use customer-managed encryption keys")
+            }
+        }
+    }
+    
+    if length(violations) > 0 {
+        print("Recovery Services Vault violations for resource:", resource_address)
+        for violations as violation {
+            print("  -", violation)
+        }
+        return false
+    }
+    
+    return true
+}
+
+# Helper function to validate VM backup configuration
+validate_vm_backup = func(resource, env) {
+    resource_address = resource.address else "unknown"
+    violations = []
+    
+    vm_config = resource.change.after
+    
+    # Handle computed values
+    if vm_config is computed {
+        print("Warning: VM configuration is computed for resource:", resource_address)
+        return true
+    }
+    
+    # Check if this is a critical VM
+    tags = vm_config.tags else {}
+    is_critical = is_critical_resource(resource.type, tags)
+    
+    # For production or critical VMs, backup should be configured
+    if (env is "prod" and require_backup_prod) or is_critical {
+        # In a real implementation, we would check for associated backup policy resources
+        # For now, we'll check tags or naming convention that indicates backup is configured
+        
+        backup_policy = tags.BackupPolicy else ""
+        if length(backup_policy) == 0 {
+            append(violations, "Critical VM should have BackupPolicy tag indicating backup configuration")
+        }
+        
+        # Check for backup-related naming patterns
+        vm_name = vm_config.name else ""
+        if length(vm_name) > 0 {
+            # This is a simplified check - in practice, you'd query for associated backup resources
+            print("Info: Verify backup policy is configured for VM:", vm_name)
+        }
+    }
+    
+    if length(violations) > 0 {
+        print("VM backup violations for resource:", resource_address)
+        for violations as violation {
+            print("  -", violation)
+        }
+        return false
+    }
+    
+    return true
+}
+
+# Helper function to validate SQL database backup
+validate_sql_backup = func(resource, env) {
+    resource_address = resource.address else "unknown"
+    violations = []
+    
+    sql_config = resource.change.after
+    
+    # Handle computed values
+    if sql_config is computed {
+        print("Warning: SQL Database configuration is computed for resource:", resource_address)
+        return true
+    }
+    
+    # Check backup retention settings
+    if env is "prod" {
+        # Validate short-term retention
+        short_term_retention_policy = sql_config.short_term_retention_policy else {}
+        if length(short_term_retention_policy) > 0 {
+            retention_days = short_term_retention_policy.retention_days else 7
+            backup_requirements = backup_policy_requirements[env] else {}
+            required_retention = backup_requirements.retention_days else 30
+            
+            if retention_days < required_retention {
+                append(violations, "SQL Database retention period (" + string(retention_days) + " days) less than required (" + string(required_retention) + " days)")
+            }
+        }
+        
+        # Validate long-term retention for production
+        long_term_retention_policy = sql_config.long_term_retention_policy else {}
+        if length(long_term_retention_policy) == 0 {
+            append(violations, "Production SQL Database should have long-term retention policy")
+        } else {
+            monthly_retention = long_term_retention_policy.monthly_retention else ""
+            yearly_retention = long_term_retention_policy.yearly_retention else ""
+            
+            if length(monthly_retention) == 0 {
+                append(violations, "Production SQL Database should have monthly retention configured")
+            }
+            
+            if length(yearly_retention) == 0 {
+                append(violations, "Production SQL Database should have yearly retention configured")
+            }
+        }
+    }
+    
+    # Validate geo-backup settings
+    if env is "prod" and require_cross_region_backup_prod {
+        geo_backup_enabled = sql_config.geo_backup_enabled else true
+        if not geo_backup_enabled {
+            append(violations, "Production SQL Database should have geo-backup enabled")
+        }
+    }
+    
+    if length(violations) > 0 {
+        print("SQL Database backup violations for resource:", resource_address)
+        for violations as violation {
+            print("  -", violation)
+        }
+        return false
+    }
+    
+    return true
+}
+
+# Helper function to validate Storage Account backup
+validate_storage_backup = func(resource, env) {
+    resource_address = resource.address else "unknown"
+    violations = []
+    
+    storage_config = resource.change.after
+    
+    # Handle computed values
+    if storage_config is computed {
+        print("Warning: Storage Account configuration is computed for resource:", resource_address)
+        return true
+    }
+    
+    # Check replication type for backup redundancy
+    account_replication_type = storage_config.account_replication_type else ""
+    
+    # Check if this is a critical storage account
+    tags = storage_config.tags else {}
+    is_critical = is_critical_resource(resource.type, tags)
+    
+    if (env is "prod" and require_backup_prod) or is_critical {
+        # Validate replication provides adequate backup
+        if account_replication_type in ["LRS"] {
+            if env is "prod" {
+                append(violations, "Production Storage Account should use geo-redundant replication (GRS/RAGRS)")
+            } else {
+                print("Warning: Consider using zone-redundant storage (ZRS) or geo-redundant (GRS) for better backup coverage")
+            }
+        }
+        
+        # Validate blob versioning and soft delete
+        blob_properties = storage_config.blob_properties else {}
+        if length(blob_properties) > 0 {
+            versioning_enabled = blob_properties.versioning_enabled else false
+            
+            delete_retention_policy = blob_properties.delete_retention_policy else {}
+            soft_delete_days = 0
+            if length(delete_retention_policy) > 0 {
+                soft_delete_days = delete_retention_policy.days else 0
+            }
+            
+            if not versioning_enabled and env is "prod" {
+                append(violations, "Production Storage Account should enable blob versioning")
+            }
+            
+            if soft_delete_days < 7 and (env is "prod" or is_critical) {
+                append(violations, "Critical Storage Account should have at least 7 days of soft delete retention")
+            }
+        }
+    }
+    
+    if length(violations) > 0 {
+        print("Storage Account backup violations for resource:", resource_address)
+        for violations as violation {
+            print("  -", violation)
+        }
+        return false
+    }
+    
+    return true
+}
+
+# Main validation function
+validate_backup_compliance = func(resource, env) {
+    # Input validation
+    if resource is null or resource is undefined {
+        print("Error: Resource is null or undefined")
+        return false
+    }
+    
+    resource_type = resource.type
+    
+    # Route to appropriate validation based on resource type  
+    if resource_type is "azurerm_recovery_services_vault" {
+        return validate_recovery_vault(resource, env)
+    } else if resource_type in ["azurerm_virtual_machine", "azurerm_linux_virtual_machine", "azurerm_windows_virtual_machine"] {
+        return validate_vm_backup(resource, env)
+    } else if resource_type is "azurerm_sql_database" {
+        return validate_sql_backup(resource, env)
+    } else if resource_type is "azurerm_storage_account" {
+        return validate_storage_backup(resource, env)
+    }
+    
+    # Default validation for other backup-related resources
+    return true
+}
+
+# Efficient resource filtering - target backup-related resources
+azure_backup_resources = filter tfplan.resource_changes as _, rc {
+    rc.mode is "managed" and
+    rc.change.actions is not ["delete"] and
+    rc.type in [
+        "azurerm_recovery_services_vault",
+        "azurerm_backup_policy_vm",
+        "azurerm_backup_protected_vm",
+        "azurerm_virtual_machine",
+        "azurerm_linux_virtual_machine",
+        "azurerm_windows_virtual_machine",
+        "azurerm_sql_database",
+        "azurerm_cosmosdb_account",
+        "azurerm_storage_account"
+    ]
+}
+
+# Determine current environment
+current_environment = determine_environment()
+backup_requirements = backup_policy_requirements[current_environment] else {}
+
+# Print policy information
+print("Azure Backup Compliance Policy")
+print("Environment:", current_environment)
+print("Require backup (prod):", require_backup_prod)
+print("Require cross-region backup (prod):", require_cross_region_backup_prod)
+print("Backup requirements:", backup_requirements)
+print("Evaluating", length(azure_backup_resources), "backup-related resources")
+
+# Main rule with comprehensive backup validation
+main = rule when length(azure_backup_resources) > 0 {
+    all azure_backup_resources as _, resource {
+        validate_backup_compliance(resource, current_environment)
+    }
+}

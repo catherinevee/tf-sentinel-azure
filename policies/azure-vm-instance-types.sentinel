@@ -1,0 +1,241 @@
+// Policy: Azure VM Instance Types Control
+// Purpose: Enforce approved VM sizes and configurations based on environment
+// Scope: Azure Virtual Machines (Linux, Windows, Scale Sets)
+// Enforcement: Soft Mandatory
+//
+// Validates:
+// - VM sizes are from approved lists per environment
+// - Cost-effective sizing recommendations
+// - Premium storage compliance for production
+// - Availability zone requirements
+
+import "tfplan/v2" as tfplan
+import "tfstate/v2" as tfstate
+import "tfconfig/v2" as tfconfig
+import "tfrun" as tfrun
+import "strings"
+
+# Parameters with secure defaults
+param environment default "dev"
+param allowed_vm_sizes default {
+    "prod": [
+        "Standard_D2s_v3", "Standard_D4s_v3", "Standard_D8s_v3", "Standard_D16s_v3",
+        "Standard_E2s_v3", "Standard_E4s_v3", "Standard_E8s_v3", "Standard_E16s_v3",
+        "Standard_F2s_v2", "Standard_F4s_v2", "Standard_F8s_v2", "Standard_F16s_v2"
+    ],
+    "staging": [
+        "Standard_B2s", "Standard_B4ms", "Standard_B8ms",
+        "Standard_D2s_v3", "Standard_D4s_v3", "Standard_D8s_v3",
+        "Standard_E2s_v3", "Standard_E4s_v3", "Standard_E8s_v3",
+        "Standard_F2s_v2", "Standard_F4s_v2", "Standard_F8s_v2"
+    ],
+    "dev": [
+        "Standard_B1s", "Standard_B1ms", "Standard_B2s", "Standard_B4ms",
+        "Standard_D2s_v3", "Standard_D4s_v3",
+        "Standard_E2s_v3", "Standard_E4s_v3"
+    ]
+}
+param require_premium_storage_prod default true
+param require_availability_zones_prod default true
+param max_vm_count_per_deployment default {
+    "prod": 10,
+    "staging": 5,
+    "dev": 3
+}
+
+# Helper function to determine environment
+determine_environment = func() {
+    workspace_name = strings.to_lower(tfrun.workspace.name)
+    
+    if strings.contains(workspace_name, "prod") {
+        return "prod"
+    } else if strings.contains(workspace_name, "staging") or strings.contains(workspace_name, "stage") {
+        return "staging"
+    } else if strings.contains(workspace_name, "dev") or strings.contains(workspace_name, "development") {
+        return "dev"
+    }
+    
+    return environment
+}
+
+# Helper function to validate VM size
+validate_vm_size = func(resource, allowed_sizes, env) {
+    resource_address = resource.address else "unknown"
+    
+    # Handle different VM resource types
+    vm_size = ""
+    if resource.type is "azurerm_virtual_machine" {
+        vm_size = resource.change.after.vm_size else ""
+    } else if resource.type in ["azurerm_linux_virtual_machine", "azurerm_windows_virtual_machine"] {
+        vm_size = resource.change.after.size else ""
+    } else if resource.type is "azurerm_virtual_machine_scale_set" {
+        vm_size = resource.change.after.sku else ""
+    }
+    
+    # Handle computed values
+    if vm_size is computed {
+        print("Warning: VM size is computed for resource:", resource_address)
+        print("Manual verification required after apply")
+        return true
+    }
+    
+    # Validate VM size is not empty
+    if length(vm_size) == 0 {
+        print("Error: VM size not specified for resource:", resource_address)
+        return false
+    }
+    
+    # Check if VM size is in allowed list
+    if vm_size not in allowed_sizes {
+        print("Error: VM size '" + vm_size + "' not allowed in " + env + " environment for resource:", resource_address)
+        print("Allowed sizes:", allowed_sizes)
+        return false
+    }
+    
+    return true
+}
+
+# Helper function to validate storage configuration
+validate_storage_config = func(resource, env) {
+    resource_address = resource.address else "unknown"
+    
+    # Only enforce premium storage for production
+    if env is not "prod" or not require_premium_storage_prod {
+        return true
+    }
+    
+    violations = []
+    
+    # Check OS disk storage type for different VM types
+    if resource.type is "azurerm_virtual_machine" {
+        storage_os_disk = resource.change.after.storage_os_disk else {}
+        if length(storage_os_disk) > 0 {
+            managed_disk_type = storage_os_disk.managed_disk_type else ""
+            if managed_disk_type not in ["Premium_LRS", "Premium_ZRS"] {
+                append(violations, "Production VMs require Premium SSD for OS disk")
+            }
+        }
+    } else if resource.type in ["azurerm_linux_virtual_machine", "azurerm_windows_virtual_machine"] {
+        os_disk = resource.change.after.os_disk else {}
+        if length(os_disk) > 0 {
+            storage_account_type = os_disk.storage_account_type else ""
+            if storage_account_type not in ["Premium_LRS", "Premium_ZRS"] {
+                append(violations, "Production VMs require Premium SSD for OS disk")
+            }
+        }
+    }
+    
+    if length(violations) > 0 {
+        print("Storage policy violations for resource:", resource_address)
+        for violations as violation {
+            print("  -", violation)
+        }
+        return false
+    }
+    
+    return true
+}
+
+# Helper function to validate availability zones
+validate_availability_zones = func(resource, env) {
+    resource_address = resource.address else "unknown"
+    
+    # Only enforce availability zones for production
+    if env is not "prod" or not require_availability_zones_prod {
+        return true
+    }
+    
+    # Check availability zones configuration
+    availability_zones = []
+    if resource.type is "azurerm_virtual_machine" {
+        availability_zones = resource.change.after.zones else []
+    } else if resource.type in ["azurerm_linux_virtual_machine", "azurerm_windows_virtual_machine"] {
+        availability_zone = resource.change.after.availability_set_id else null
+        zone = resource.change.after.zone else null
+        if zone is not null {
+            availability_zones = [zone]
+        }
+    }
+    
+    # Handle computed zones
+    if availability_zones is computed {
+        print("Warning: Availability zones are computed for resource:", resource_address)
+        return true
+    }
+    
+    if length(availability_zones) == 0 {
+        print("Warning: Production VM should be deployed across availability zones for high availability:", resource_address)
+        # Return true for soft enforcement
+        return true
+    }
+    
+    return true
+}
+
+# Main validation function
+validate_vm_resource = func(resource, allowed_sizes, env) {
+    # Input validation
+    if resource is null or resource is undefined {
+        print("Error: Resource is null or undefined")
+        return false
+    }
+    
+    # Validate VM size
+    if not validate_vm_size(resource, allowed_sizes, env) {
+        return false
+    }
+    
+    # Validate storage configuration
+    if not validate_storage_config(resource, env) {
+        return false
+    }
+    
+    # Validate availability zones
+    if not validate_availability_zones(resource, env) {
+        return false
+    }
+    
+    return true
+}
+
+# Efficient resource filtering - target VM resources
+azure_vm_resources = filter tfplan.resource_changes as _, rc {
+    rc.mode is "managed" and
+    rc.change.actions is not ["delete"] and
+    rc.type in [
+        "azurerm_virtual_machine",
+        "azurerm_linux_virtual_machine",
+        "azurerm_windows_virtual_machine",
+        "azurerm_virtual_machine_scale_set"
+    ]
+}
+
+# Determine current environment and allowed sizes
+current_environment = determine_environment()
+allowed_sizes_for_env = allowed_vm_sizes[current_environment] else []
+max_vms_allowed = max_vm_count_per_deployment[current_environment] else 999
+
+# Check VM count limits
+vm_count_check = rule {
+    length(azure_vm_resources) <= max_vms_allowed
+}
+
+# Print policy information
+print("Azure VM Instance Types Policy")
+print("Environment:", current_environment) 
+print("Allowed VM sizes:", allowed_sizes_for_env)
+print("Evaluating", length(azure_vm_resources), "VM resources")
+print("Max VMs allowed:", max_vms_allowed)
+
+# Validate VM count doesn't exceed limits
+if length(azure_vm_resources) > max_vms_allowed {
+    print("Error: Deployment contains", length(azure_vm_resources), "VMs, but maximum allowed is", max_vms_allowed)
+}
+
+# Main rule with comprehensive validation
+main = rule when length(azure_vm_resources) > 0 {
+    vm_count_check and
+    all azure_vm_resources as _, resource {
+        validate_vm_resource(resource, allowed_sizes_for_env, current_environment)
+    }
+}

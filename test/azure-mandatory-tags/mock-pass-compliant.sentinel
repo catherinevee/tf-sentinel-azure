@@ -1,0 +1,68 @@
+import "tfplan/v2"
+
+resource_changes = {
+  "azurerm_resource_group.example": {
+    "address": "azurerm_resource_group.example",
+    "mode": "managed",
+    "type": "azurerm_resource_group",
+    "name": "example",
+    "provider_name": "registry.terraform.io/hashicorp/azurerm",
+    "change": {
+      "actions": ["create"],
+      "before": null,
+      "after": {
+        "location": "East US",
+        "name": "rg-example-dev-001",
+        "tags": {
+          "Environment": "dev",
+          "Owner": "john.doe@company.com",
+          "Project": "WebApp",
+          "CostCenter": "Engineering",
+          "Application": "CustomerPortal"
+        }
+      },
+      "after_unknown": {},
+      "before_sensitive": false,
+      "after_sensitive": {
+        "tags": {}
+      }
+    }
+  },
+  "azurerm_virtual_machine.example": {
+    "address": "azurerm_virtual_machine.example",
+    "mode": "managed", 
+    "type": "azurerm_virtual_machine",
+    "name": "example",
+    "provider_name": "registry.terraform.io/hashicorp/azurerm",
+    "change": {
+      "actions": ["create"],
+      "before": null,
+      "after": {
+        "name": "vm-web-dev-001",
+        "location": "East US",
+        "resource_group_name": "rg-example-dev-001",
+        "vm_size": "Standard_B2s",
+        "tags": {
+          "Environment": "dev",
+          "Owner": "jane.smith@company.com", 
+          "Project": "WebApp",
+          "CostCenter": "Engineering",
+          "Application": "CustomerPortal"
+        }
+      },
+      "after_unknown": {
+        "id": true
+      },
+      "before_sensitive": false,
+      "after_sensitive": {
+        "tags": {}
+      }
+    }
+  }
+}
+
+tfplan = {
+  "format_version": "1.1",
+  "terraform_version": "1.5.0",
+  "resource_changes": resource_changes
+}

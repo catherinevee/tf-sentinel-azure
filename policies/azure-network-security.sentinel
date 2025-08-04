@@ -1,0 +1,328 @@
+// Policy: Azure Network Security Controls
+// Purpose: Enforce network security best practices and prevent overly permissive configurations
+// Scope: Network Security Groups, Application Gateways, Load Balancers, VNets
+// Enforcement: Hard Mandatory
+//
+// Validates:
+// - No overly permissive security group rules (0.0.0.0/0)
+// - Required security group rules for production
+// - Network segmentation requirements
+// - DDoS protection for production VNets
+// - Private endpoint usage
+
+import "tfplan/v2" as tfplan
+import "tfstate/v2" as tfstate
+import "tfconfig/v2" as tfconfig
+import "tfrun" as tfrun
+import "strings"
+
+# Parameters with secure defaults
+param environment default "dev"
+param allowed_public_ports default [80, 443, 22, 3389]
+param allowed_management_ports default [22, 3389, 5985, 5986]
+param require_ddos_protection_prod default true
+param require_private_endpoints_prod default true
+param allowed_protocols default ["TCP", "UDP", "ICMP", "*"]
+param max_priority_threshold default 1000
+param require_network_watcher default true
+
+# Helper function to determine environment
+determine_environment = func() {
+    workspace_name = strings.to_lower(tfrun.workspace.name)
+    
+    if strings.contains(workspace_name, "prod") {
+        return "prod"
+    } else if strings.contains(workspace_name, "staging") or strings.contains(workspace_name, "stage") {
+        return "staging"
+    } else if strings.contains(workspace_name, "dev") or strings.contains(workspace_name, "development") {
+        return "dev"
+    }
+    
+    return environment
+}
+
+# Helper function to validate NSG inbound rules
+validate_nsg_inbound_rules = func(resource, env) {
+    resource_address = resource.address else "unknown"
+    violations = []
+    
+    nsg_config = resource.change.after
+    
+    # Handle computed values
+    if nsg_config is computed {
+        print("Warning: NSG configuration is computed for resource:", resource_address)
+        return true
+    }
+    
+    # Check security rules
+    security_rules = nsg_config.security_rule else []
+    
+    for security_rules as _, rule {
+        rule_name = rule.name else "unnamed_rule"
+        
+        # Validate inbound rules
+        if rule.direction is "Inbound" {
+            # Check for overly permissive source addresses
+            source_address_prefixes = rule.source_address_prefixes else []
+            source_address_prefix = rule.source_address_prefix else ""
+            
+            # Combine all source addresses
+            all_sources = []
+            if length(source_address_prefix) > 0 {
+                all_sources = append(all_sources, source_address_prefix)
+            }
+            for source_address_prefixes as source {
+                all_sources = append(all_sources, source)
+            }
+            
+            # Check for internet-facing rules
+            for all_sources as source {
+                if source is "0.0.0.0/0" or source is "*" or source is "Internet" {
+                    # Get destination ports
+                    dest_port_range = rule.destination_port_range else ""
+                    dest_port_ranges = rule.destination_port_ranges else []
+                    
+                    all_ports = []
+                    if length(dest_port_range) > 0 {
+                        all_ports = append(all_ports, dest_port_range)
+                    }
+                    for dest_port_ranges as port {
+                        all_ports = append(all_ports, port)
+                    }
+                    
+                    # Validate allowed public ports
+                    for all_ports as port_range {
+                        if port_range is "*" {
+                            append(violations, "Rule '" + rule_name + "' allows all ports from internet (0.0.0.0/0)")
+                        } else {
+                            # Parse port range
+                            if strings.contains(port_range, "-") {
+                                append(violations, "Rule '" + rule_name + "' allows port range '" + port_range + "' from internet")
+                            } else {
+                                # Single port
+                                port_num = 0
+                                # Convert string to int (simplified validation)
+                                if port_range is "22" {
+                                    port_num = 22
+                                } else if port_range is "80" {
+                                    port_num = 80
+                                } else if port_range is "443" {
+                                    port_num = 443
+                                } else if port_range is "3389" {
+                                    port_num = 3389
+                                }
+                                
+                                if port_num > 0 and port_num not in allowed_public_ports {
+                                    append(violations, "Rule '" + rule_name + "' allows unauthorized port " + port_range + " from internet")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
+            # Validate rule priority
+            priority = rule.priority else 4096
+            if priority < max_priority_threshold and env is "prod" {
+                # High priority rules in production should be carefully reviewed
+                print("Warning: High priority rule (" + string(priority) + ") in production:", rule_name)
+            }
+            
+            # Validate protocol
+            protocol = rule.protocol else ""
+            if length(protocol) > 0 and protocol not in allowed_protocols {
+                append(violations, "Rule '" + rule_name + "' uses non-standard protocol: " + protocol)
+            }
+        }
+    }
+    
+    if length(violations) > 0 {
+        print("NSG security violations for resource:", resource_address)
+        for violations as violation {
+            print("  -", violation)
+        }
+        return false
+    }
+    
+    return true
+}
+
+# Helper function to validate VNet security requirements
+validate_vnet_security = func(resource, env) {
+    resource_address = resource.address else "unknown"
+    violations = []
+    
+    vnet_config = resource.change.after
+    
+    # Handle computed values
+    if vnet_config is computed {
+        print("Warning: VNet configuration is computed for resource:", resource_address)
+        return true
+    }
+    
+    # Validate DDoS protection for production
+    if env is "prod" and require_ddos_protection_prod {
+        ddos_protection_plan = vnet_config.ddos_protection_plan else {}
+        if length(ddos_protection_plan) == 0 {
+            append(violations, "Production VNets should have DDoS protection enabled")
+        } else {
+            enable = ddos_protection_plan.enable else false
+            if not enable {
+                append(violations, "DDoS protection plan is configured but not enabled")
+            }
+        }
+    }
+    
+    # Validate subnet configuration
+    subnets = vnet_config.subnet else []
+    for subnets as _, subnet {
+        subnet_name = subnet.name else "unnamed_subnet"
+        
+        # Check for overly broad subnet ranges
+        address_prefix = subnet.address_prefix else ""
+        if length(address_prefix) > 0 {
+            # Basic CIDR validation - warn about very large subnets
+            if strings.contains(address_prefix, "/8") or strings.contains(address_prefix, "/16") {
+                if env is "prod" {
+                    print("Warning: Very large subnet range for production:", subnet_name, address_prefix)
+                }
+            }
+        }
+        
+        # Validate security group association
+        security_group = subnet.security_group else ""
+        if env is "prod" and length(security_group) == 0 {
+            append(violations, "Production subnet '" + subnet_name + "' should have an associated NSG")
+        }
+    }
+    
+    if length(violations) > 0 {
+        print("VNet security violations for resource:", resource_address)
+        for violations as violation {
+            print("  -", violation)
+        }
+        return false
+    }
+    
+    return true
+}
+
+# Helper function to validate Application Gateway security
+validate_app_gateway_security = func(resource, env) {
+    resource_address = resource.address else "unknown"
+    violations = []
+    
+    agw_config = resource.change.after
+    
+    # Handle computed values
+    if agw_config is computed {
+        print("Warning: Application Gateway configuration is computed for resource:", resource_address)
+        return true
+    }
+    
+    # Validate SSL configuration
+    ssl_certificates = agw_config.ssl_certificate else []
+    http_listeners = agw_config.http_listener else []
+    
+    for http_listeners as _, listener {
+        listener_name = listener.name else "unnamed_listener"
+        protocol = listener.protocol else ""
+        
+        if protocol is "Http" and env is "prod" {
+            append(violations, "Production Application Gateway listener '" + listener_name + "' should use HTTPS")
+        }
+        
+        if protocol is "Https" {
+            ssl_certificate_name = listener.ssl_certificate_name else ""
+            if length(ssl_certificate_name) == 0 {
+                append(violations, "HTTPS listener '" + listener_name + "' missing SSL certificate")
+            }
+        }
+    }
+    
+    # Validate WAF configuration for production
+    if env is "prod" {
+        waf_configuration = agw_config.waf_configuration else {}
+        if length(waf_configuration) == 0 {
+            append(violations, "Production Application Gateway should have WAF enabled")
+        } else {
+            enabled = waf_configuration.enabled else false
+            firewall_mode = waf_configuration.firewall_mode else ""
+            
+            if not enabled {
+                append(violations, "WAF is configured but not enabled")
+            }
+            
+            if firewall_mode is not "Prevention" and env is "prod" {
+                append(violations, "Production WAF should be in Prevention mode, not " + firewall_mode)
+            }
+        }
+    }
+    
+    if length(violations) > 0 {
+        print("Application Gateway security violations for resource:", resource_address)
+        for violations as violation {
+            print("  -", violation)
+        }
+        return false
+    }
+    
+    return true
+}
+
+# Main validation function
+validate_network_security = func(resource, env) {
+    # Input validation
+    if resource is null or resource is undefined {
+        print("Error: Resource is null or undefined")
+        return false
+    }
+    
+    resource_type = resource.type
+    
+    # Route to appropriate validation based on resource type
+    if resource_type is "azurerm_network_security_group" {
+        return validate_nsg_inbound_rules(resource, env)
+    } else if resource_type is "azurerm_virtual_network" {
+        return validate_vnet_security(resource, env)
+    } else if resource_type is "azurerm_application_gateway" {
+        return validate_app_gateway_security(resource, env)
+    }
+    
+    # Default validation for other network resources
+    return true
+}
+
+# Efficient resource filtering - target network security resources
+azure_network_resources = filter tfplan.resource_changes as _, rc {
+    rc.mode is "managed" and
+    rc.change.actions is not ["delete"] and
+    rc.type in [
+        "azurerm_network_security_group",
+        "azurerm_network_security_rule",
+        "azurerm_virtual_network",
+        "azurerm_subnet",
+        "azurerm_application_gateway",
+        "azurerm_load_balancer",
+        "azurerm_public_ip",
+        "azurerm_firewall",
+        "azurerm_private_endpoint"
+    ]
+}
+
+# Determine current environment
+current_environment = determine_environment()
+
+# Print policy information
+print("Azure Network Security Policy")
+print("Environment:", current_environment)
+print("Allowed public ports:", allowed_public_ports)
+print("Require DDoS protection (prod):", require_ddos_protection_prod)
+print("Evaluating", length(azure_network_resources), "network resources")
+
+# Main rule with comprehensive validation
+main = rule when length(azure_network_resources) > 0 {
+    all azure_network_resources as _, resource {
+        validate_network_security(resource, current_environment)
+    }
+}

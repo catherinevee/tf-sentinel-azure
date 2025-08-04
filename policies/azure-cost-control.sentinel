@@ -1,0 +1,296 @@
+// Policy: Azure Cost Control and Optimization
+// Purpose: Enforce cost management policies and prevent cost overruns
+// Scope: All Azure resources with cost implications  
+// Enforcement: Soft Mandatory
+//
+// Validates:
+// - Monthly cost limits per environment
+// - Cost increase percentage thresholds
+// - Resource count limits
+// - Expensive resource type restrictions
+// - Budget allocation compliance
+
+import "tfplan/v2" as tfplan
+import "tfstate/v2" as tfstate
+import "tfconfig/v2" as tfconfig
+import "tfrun" as tfrun
+import "strings"
+import "decimal"
+
+# Parameters with secure defaults
+param environment default "dev"
+param monthly_cost_limits default {
+    "prod": decimal.new(10000),
+    "staging": decimal.new(3000),
+    "dev": decimal.new(1000)
+}
+param cost_increase_percentage_limit default 50
+param expensive_resource_types default [
+    "azurerm_hdinsight_hadoop_cluster",
+    "azurerm_hdinsight_spark_cluster", 
+    "azurerm_synapse_workspace",
+    "azurerm_databricks_workspace",
+    "azurerm_machine_learning_workspace"
+]
+param max_resource_counts default {
+    "prod": {
+        "azurerm_virtual_machine": 20,
+        "azurerm_kubernetes_cluster": 5,
+        "azurerm_app_service_plan": 10
+    },
+    "staging": {
+        "azurerm_virtual_machine": 10,
+        "azurerm_kubernetes_cluster": 3,
+        "azurerm_app_service_plan": 5
+    },
+    "dev": {
+        "azurerm_virtual_machine": 5,
+        "azurerm_kubernetes_cluster": 2,
+        "azurerm_app_service_plan": 3
+    }
+}
+param require_cost_center_tag default true
+param allowed_cost_centers default ["Engineering", "Marketing", "Sales", "Operations", "R&D"]
+
+# Helper function to determine environment
+determine_environment = func() {
+    workspace_name = strings.to_lower(tfrun.workspace.name)
+    
+    if strings.contains(workspace_name, "prod") {
+        return "prod"
+    } else if strings.contains(workspace_name, "staging") or strings.contains(workspace_name, "stage") {
+        return "staging"
+    } else if strings.contains(workspace_name, "dev") or strings.contains(workspace_name, "development") {
+        return "dev"
+    }
+    
+    return environment
+}
+
+# Helper function to validate monthly cost limits
+validate_monthly_cost_limit = func(env) {
+    # Check if cost estimate is available
+    if tfrun.cost_estimate is null or tfrun.cost_estimate is undefined {
+        print("Warning: Cost estimate not available for this run")
+        return true  # Allow if cost data unavailable
+    }
+    
+    cost_limit = monthly_cost_limits[env] else decimal.new(1000)
+    
+    # Get delta monthly cost
+    delta_monthly_cost_str = tfrun.cost_estimate.delta_monthly_cost else "0"
+    delta_monthly_cost = decimal.new(delta_monthly_cost_str)
+    
+    # Check if delta cost exceeds limit
+    if decimal.greater_than(delta_monthly_cost, cost_limit) {
+        print("Error: Monthly cost increase of $" + string(delta_monthly_cost) + " exceeds limit of $" + string(cost_limit) + " for " + env + " environment")
+        return false
+    }
+    
+    # Check percentage increase if prior cost exists
+    prior_monthly_cost_str = tfrun.cost_estimate.prior_monthly_cost else "0"
+    prior_monthly_cost = decimal.new(prior_monthly_cost_str)
+    
+    if decimal.greater_than(prior_monthly_cost, decimal.new(0)) {
+        # Calculate percentage increase
+        percentage_increase = decimal.multiply(
+            decimal.divide(delta_monthly_cost, prior_monthly_cost),
+            decimal.new(100)
+        )
+        
+        percentage_limit = decimal.new(cost_increase_percentage_limit)
+        
+        if decimal.greater_than(percentage_increase, percentage_limit) {
+            print("Error: Cost increase of", string(percentage_increase) + "% exceeds threshold of", string(percentage_limit) + "%")
+            return false
+        }
+        
+        print("Cost increase:", string(percentage_increase) + "% (within", string(percentage_limit) + "% limit)")
+    }
+    
+    print("Monthly cost increase: $" + string(delta_monthly_cost) + " (limit: $" + string(cost_limit) + ")")
+    return true
+}
+
+# Helper function to validate expensive resource types
+validate_expensive_resources = func(resources, env) {
+    violations = []
+    
+    for resources as _, resource {
+        resource_type = resource.type
+        resource_address = resource.address else "unknown"
+        
+        if resource_type in expensive_resource_types {
+            # Check if expensive resources are allowed in this environment
+            if env is "dev" {
+                append(violations, "Expensive resource type '" + resource_type + "' not recommended for dev environment: " + resource_address)
+            } else if env is "staging" {
+                print("Warning: Expensive resource type in staging environment:", resource_type, "at", resource_address)
+                # Allow but warn for staging
+            }
+            
+            # Validate cost center tag for expensive resources
+            if require_cost_center_tag {
+                resource_tags = resource.change.after.tags else {}
+                cost_center = resource_tags.CostCenter else ""
+                
+                if length(cost_center) == 0 {
+                    append(violations, "Expensive resource '" + resource_address + "' missing required CostCenter tag")
+                } else if cost_center not in allowed_cost_centers {
+                    append(violations, "Invalid CostCenter '" + cost_center + "' for resource: " + resource_address)
+                }
+            }
+        }
+    }
+    
+    if length(violations) > 0 {
+        print("Expensive resource violations:")
+        for violations as violation {
+            print("  -", violation)
+        }
+        return false
+    }
+    
+    return true
+}
+
+# Helper function to validate resource count limits
+validate_resource_counts = func(resources, env) {
+    violations = []
+    resource_counts = {}
+    max_counts = max_resource_counts[env] else {}
+    
+    # Count resources by type
+    for resources as _, resource {
+        resource_type = resource.type
+        current_count = resource_counts[resource_type] else 0
+        resource_counts[resource_type] = current_count + 1
+    }
+    
+    # Check against limits
+    for resource_counts as resource_type, count {
+        max_allowed = max_counts[resource_type] else 999
+        
+        if count > max_allowed {
+            append(violations, "Resource type '" + resource_type + "' count (" + string(count) + ") exceeds limit (" + string(max_allowed) + ") for " + env + " environment")
+        }
+    }
+    
+    if length(violations) > 0 {
+        print("Resource count violations:")
+        for violations as violation {
+            print("  -", violation)
+        }
+        return false
+    }
+    
+    # Print resource counts for information
+    print("Resource counts by type:")
+    for resource_counts as resource_type, count {
+        max_allowed = max_counts[resource_type] else 999
+        print("  -", resource_type + ":", string(count) + "/" + string(max_allowed))
+    }
+    
+    return true
+}
+
+# Helper function to validate cost optimization settings
+validate_cost_optimization = func(resource, env) {
+    resource_address = resource.address else "unknown"
+    resource_type = resource.type
+    violations = []
+    
+    # VM-specific cost optimizations
+    if resource_type in ["azurerm_virtual_machine", "azurerm_linux_virtual_machine", "azurerm_windows_virtual_machine"] {
+        vm_config = resource.change.after
+        
+        # Check for spot instances in non-production
+        if env is not "prod" {
+            priority = vm_config.priority else "Regular"
+            if priority is not "Spot" {
+                print("Info: Consider using Spot instances for cost savings in " + env + " environment:", resource_address)
+            }
+        }
+        
+        # Validate auto-shutdown for dev/staging VMs
+        if env in ["dev", "staging"] {
+            # Check if auto-shutdown is configured (this would typically be in tags or separate resources)
+            tags = vm_config.tags else {}
+            auto_shutdown = tags.AutoShutdown else ""
+            if length(auto_shutdown) == 0 {
+                print("Warning: Consider configuring auto-shutdown for cost savings:", resource_address)
+            }
+        }
+    }
+    
+    # App Service Plan cost optimizations
+    if resource_type is "azurerm_app_service_plan" {
+        plan_config = resource.change.after
+        sku = plan_config.sku else {}
+        
+        if length(sku) > 0 {
+            tier = sku.tier else ""
+            size = sku.size else ""
+            
+            # Warn about expensive tiers in non-production
+            if env is not "prod" and tier in ["Premium", "PremiumV2", "PremiumV3"] {
+                print("Warning: Expensive App Service Plan tier '" + tier + "' in " + env + " environment:", resource_address)
+            }
+        }
+    }
+    
+    # Storage account cost optimizations
+    if resource_type is "azurerm_storage_account" {
+        storage_config = resource.change.after
+        account_tier = storage_config.account_tier else ""
+        account_replication_type = storage_config.account_replication_type else ""
+        
+        # Recommend cost-effective storage for non-production
+        if env is not "prod" {
+            if account_tier is "Premium" {
+                print("Warning: Premium storage tier in " + env + " environment may be unnecessarily expensive:", resource_address)
+            }
+            
+            if account_replication_type in ["GRS", "RAGRS", "GZRS", "RAGZRS"] {
+                print("Warning: Geo-redundant storage in " + env + " environment may be unnecessarily expensive:", resource_address)
+            }
+        }
+    }
+    
+    return true
+}
+
+# Efficient resource filtering - target all managed resources
+azure_cost_resources = filter tfplan.resource_changes as _, rc {
+    rc.mode is "managed" and
+    rc.change.actions is not ["delete"]
+}
+
+# Determine current environment
+current_environment = determine_environment()
+
+# Print policy information
+print("Azure Cost Control Policy")
+print("Environment:", current_environment)
+print("Monthly cost limit:", monthly_cost_limits[current_environment] else "No limit")
+print("Cost increase limit:", string(cost_increase_percentage_limit) + "%")
+print("Evaluating", length(azure_cost_resources), "resources")
+
+# Validate monthly cost limits
+cost_limit_check = validate_monthly_cost_limit(current_environment)
+
+# Validate expensive resources
+expensive_resources_check = validate_expensive_resources(azure_cost_resources, current_environment)
+
+# Validate resource counts
+resource_count_check = validate_resource_counts(azure_cost_resources, current_environment)
+
+# Main rule with comprehensive cost validation
+main = rule {
+    cost_limit_check and
+    expensive_resources_check and
+    resource_count_check and
+    all azure_cost_resources as _, resource {
+        validate_cost_optimization(resource, current_environment)
+    }
+}

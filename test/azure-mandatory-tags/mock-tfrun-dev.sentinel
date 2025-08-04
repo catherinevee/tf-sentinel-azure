@@ -1,0 +1,7 @@
+import "tfrun"
+
+tfrun = {
+  "workspace": {
+    "name": "development-eastus-001"
+  }
+}
